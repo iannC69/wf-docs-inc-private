@@ -1,0 +1,320 @@
+import { execSync } from 'child_process'
+import fs from 'fs'
+import path from 'path'
+import { commitCache } from './commitCache'
+
+const VIRTUAL_ID = 'virtual:last-updates'
+const RESOLVED_ID = '\0virtual:last-updates'
+
+const SECTION_COLOR_MAP: Record<string, string> = {
+  informatii: 'orange',
+  currency: 'green',
+  systems: 'red',
+  market: 'purple',
+  updates_wiki: 'amber',
+}
+
+const COLOR_MAP: Record<string, string> = {
+  PageTagRed: 'red',
+  PageTagBlue: 'blue',
+  PageTagGreen: 'green',
+  PageTagPurple: 'purple',
+  PageTagPink: 'pink',
+  PageTagOrange: 'orange',
+  PageTagTeal: 'teal',
+  PageTagAmber: 'amber',
+  PageTagYellow: 'amber',
+  PageTagIndigo: 'purple',
+  PageTagCyan: 'teal',
+  PageTagFuchsia: 'pink',
+  PageTagEmerald: 'green',
+  PageTagGray: 'blue',
+}
+
+export interface UpdateCard {
+  title: string
+  category: string
+  tagColor: string
+  dotClass: string
+  tag1: string
+  tag2: string
+  link: string
+  date: string
+  username: string
+  avatarUrl: string
+  profileUrl: string
+  buttonText: string
+  icon: string
+}
+
+// Section-level fallback icons (used when a page has no direct sidebar icon)
+const SECTION_ICON_MAP: Record<string, string> = {
+  informatii: 'solar:fire-bold-duotone',
+  currency: 'solar:dollar-minimalistic-bold-duotone',
+  systems: 'solar:cpu-bold-duotone',
+  market: 'solar:shop-2-bold-duotone',
+  updates_wiki: 'solar:code-bold-duotone',
+}
+
+/**
+ * Parse config.mts as raw text to extract sidebar link → icon mappings.
+ * Matches patterns like: icon="solar:fire-bold-duotone" ... link: '/informatii/about'
+ */
+function buildIconMap(configPath: string): Record<string, string> {
+  const map: Record<string, string> = {}
+  try {
+    const raw = fs.readFileSync(configPath, 'utf-8')
+    // Match sidebar items that have both an icon and a link on the same line
+    // e.g. { text: '<iconify-icon icon="solar:star-bold-duotone" ...> Despre', link: '/informatii/about' }
+    const re = /icon="([^"]+)"[^}]*link:\s*['"]([^'"]+)['"]/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(raw)) !== null) {
+      map[m[2]] = m[1]
+    }
+  } catch {}
+  return map
+}
+
+function extractUsername(email: string, name: string): string {
+  const m1 = email.match(/^\d+\+(.+)@users\.noreply\.github\.com$/)
+  if (m1) return m1[1]
+  const m2 = email.match(/^(.+)@users\.noreply\.github\.com$/)
+  if (m2) return m2[1]
+  return name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'unknown'
+}
+
+function formatDate(d: Date): string {
+  return [
+    String(d.getDate()).padStart(2, '0'),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    d.getFullYear()
+  ].join('.')
+}
+
+function parseTags(str: string): Array<{ text: string; component: string }> {
+  const tags: Array<{ text: string; component: string }> = []
+  const re = /\{[^}]*text:\s*['"]([^'"]*)['"]\s*,\s*component:\s*['"]([^'"]*)['"]\s*\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(str)) !== null) {
+    tags.push({ text: m[1], component: m[2] })
+  }
+  return tags
+}
+
+function parsePath(str: string): string[] {
+  const result: string[] = []
+  const re = /['"]([^'"]+)['"]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(str)) !== null) {
+    result.push(m[1])
+  }
+  return result
+}
+
+interface ParsedHeader {
+  title: string
+  tags: Array<{ text: string; component: string }>
+  pathArr: string[]
+  badgeText: string
+}
+
+function parseCaseHeader(content: string): ParsedHeader | null {
+  const blockM = content.match(/<CaseHeader\s+([\s\S]*?)\/>/)
+  if (!blockM) return null
+  const block = blockM[1]
+
+  const titleM = block.match(/\btitle="([^"]+)"/)
+  if (!titleM) return null
+
+  const tagsM = block.match(/:tags="(\[[\s\S]*?\])"/)
+  const pathM = block.match(/:path="(\[[\s\S]*?\])"/)
+  const badgeM = block.match(/badge-text="([^"]+)"/)
+
+  return {
+    title: titleM[1],
+    tags: tagsM ? parseTags(tagsM[1]) : [],
+    pathArr: pathM ? parsePath(pathM[1]) : [],
+    badgeText: badgeM ? badgeM[1] : ''
+  }
+}
+
+function getGitInfo(filepath: string, repoRoot: string): { timestamp: number; username: string; date: string } {
+  try {
+    const rel = path.relative(repoRoot, filepath).replace(/\\/g, '/')
+    const raw = execSync(`git log -1 --format="%ct|%ae|%an" -- "${rel}"`, {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe']
+    }).trim().replace(/^"|"$/g, '')
+
+    if (!raw) {
+      return { timestamp: Math.floor(Date.now() / 1000), username: 'unknown', date: formatDate(new Date()) }
+    }
+
+    const [ts, email, name] = raw.split('|')
+    const timestamp = parseInt(ts) || 0
+    const username = extractUsername(email || '', name || '')
+    return { timestamp, username, date: formatDate(new Date(timestamp * 1000)) }
+  } catch {
+    return { timestamp: 0, username: 'unknown', date: '—' }
+  }
+}
+
+async function resolveAuthorLogin(docsRelPath: string, token: string): Promise<string | null> {
+  if (!docsRelPath || !token) return null
+  try {
+    // commits?path= resolves through merge commits → returns actual PR author (same as transformPageData)
+    const repoPath = 'docs/' + docsRelPath.replace(/\\/g, '/')
+    const res = await fetch(
+      `https://api.github.com/repos/Wildfiire/docs/commits?path=${encodeURIComponent(repoPath)}&per_page=1`,
+      { headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json' } }
+    )
+    if (!res.ok) return null
+    const data = await res.json() as any[]
+    const commit = data[0]
+    if (!commit) return null
+    let login: string | null = commit.author?.login || null
+    // If merge commit hides author, check associated PR
+    if (!login) {
+      const prRes = await fetch(
+        `https://api.github.com/repos/Wildfiire/docs/commits/${commit.sha}/pulls`,
+        { headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json' } }
+      )
+      if (prRes.ok) {
+        const prs = await prRes.json() as any[]
+        login = prs[0]?.user?.login || null
+      }
+    }
+    return login
+  } catch {
+    return null
+  }
+}
+
+function walkMd(dir: string): string[] {
+  const out: string[] = []
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+        out.push(...walkMd(full))
+      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+        out.push(full)
+      }
+    }
+  } catch {}
+  return out
+}
+
+async function buildCards(docsDir: string, repoRoot: string): Promise<UpdateCard[]> {
+  const configPath = path.join(docsDir, '.vitepress', 'config.mts')
+  const iconMap = buildIconMap(configPath)
+  const files = walkMd(docsDir)
+  const results: Array<UpdateCard & { timestamp: number; docsRelPath: string }> = []
+
+  for (const filepath of files) {
+    try {
+      const content = fs.readFileSync(filepath, 'utf-8')
+      const header = parseCaseHeader(content)
+      if (!header) continue
+
+      const { title, tags, pathArr, badgeText } = header
+      const git = getGitInfo(filepath, repoRoot)
+      const rel = path.relative(docsDir, filepath)
+      const link = '/' + rel.replace(/\\/g, '/').replace(/\.md$/, '')
+      const sectionFolder = rel.split(/[\\/]/)[0]
+      const tagColor = SECTION_COLOR_MAP[sectionFolder] || (tags[0] ? (COLOR_MAP[tags[0].component] || 'red') : 'red')
+      const category = pathArr.length >= 2
+        ? pathArr[pathArr.length - 2]
+        : (pathArr[0] || title)
+
+      // Resolve icon: direct sidebar match → section fallback → generic
+      const pageIcon = iconMap[link]
+        || SECTION_ICON_MAP[sectionFolder]
+        || 'mdi:file-document-outline'
+
+      results.push({
+        title,
+        category: category.toUpperCase(),
+        tagColor,
+        dotClass: `dot-${tagColor}`,
+        tag1: (tags[0]?.text || '').toUpperCase(),
+        tag2: (tags[1]?.text || '').toUpperCase(),
+        link,
+        date: git.date,
+        timestamp: git.timestamp,
+        docsRelPath: rel.replace(/\\/g, '/'),
+        username: git.username,
+        avatarUrl: `https://github.com/${git.username}.png?size=44`,
+        profileUrl: `https://github.com/${git.username}`,
+        buttonText: badgeText ? badgeText.toUpperCase() : 'CITESTE',
+        icon: pageIcon
+      })
+    } catch {
+      // skip unparseable files
+    }
+  }
+
+  results.sort((a, b) => b.timestamp - a.timestamp)
+  const top6 = results.slice(0, 6)
+
+  // Resolve real GitHub login for each card in parallel
+  // Uses commits?path= so PR submitter is returned, not the merger
+  const token = process.env.VITE_GITHUB_TOKEN || ''
+  if (!token) {
+    console.warn('[lastUpdatesPlugin] VITE_GITHUB_TOKEN not found — falling back to git email heuristic for usernames')
+  }
+  const logins = await Promise.all(top6.map(c => resolveAuthorLogin(c.docsRelPath, token)))
+
+  return top6.map(({ timestamp: _t, docsRelPath: _p, ...card }, i) => {
+    const login = logins[i]
+    if (login) {
+      card.username = login
+      card.avatarUrl = `https://github.com/${login}.png?size=44`
+      card.profileUrl = `https://github.com/${login}`
+    }
+    return card as UpdateCard
+  })
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function lastUpdatesPlugin(docsDir: string, repoRoot: string): any {
+  let cachedPromise: Promise<UpdateCard[]> | null = null
+
+  function getCards(): Promise<UpdateCard[]> {
+    if (!cachedPromise) cachedPromise = buildCards(docsDir, repoRoot)
+    return cachedPromise
+  }
+
+  return {
+    name: 'vitepress-last-updates',
+    enforce: 'pre',
+
+    resolveId(id: string) {
+      if (id === VIRTUAL_ID) return RESOLVED_ID
+    },
+
+    buildStart() {
+      cachedPromise = buildCards(docsDir, repoRoot)
+    },
+
+    async load(id: string) {
+      if (id !== RESOLVED_ID) return
+      const cards = await getCards()
+      return `export default ${JSON.stringify(cards)}`
+    },
+
+    handleHotUpdate({ file, server }: { file: string; server: any }) {
+      if (file.endsWith('.md')) {
+        // Invalidate lastUpdates virtual module
+        cachedPromise = null
+        const mod = server.moduleGraph.getModuleById(RESOLVED_ID)
+        if (mod) server.moduleGraph.invalidateModule(mod)
+        // Invalidate transformPageData cache so updated-by re-fetches for this file
+        const repoPath = 'docs/' + path.relative(docsDir, file).replace(/\\/g, '/')
+        commitCache.delete(repoPath)
+        server.ws.send({ type: 'full-reload' })
+      }
+    }
+  }
+}
